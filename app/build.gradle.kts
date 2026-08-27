@@ -13,12 +13,14 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        manifestPlaceholders["appLabel"] = "Highlight Dual Sub Lab"
     }
 
     buildTypes {
         debug {
             applicationIdSuffix = ".preview"
             versionNameSuffix = "-preview"
+            manifestPlaceholders["appLabel"] = "Highlight Dual Sub Lab Preview"
         }
         release {
             isMinifyEnabled = false
