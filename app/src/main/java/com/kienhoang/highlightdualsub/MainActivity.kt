@@ -37,6 +37,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var translator: Translator
     private var translationReady = false
     private var translationGeneration = 0
+    private var lastTranslatedCaption = ""
+
+    private val captionEngineScript: String by lazy {
+        assets.open("youtube-caption-engine.js")
+            .bufferedReader()
+            .use { it.readText() }
+    }
 
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,8 +70,8 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
-                statusText.text = "YouTube loaded • enabling native caption observer"
-                injectNativeCaptionObserver()
+                statusText.text = "YouTube loaded • starting caption engine"
+                injectCaptionEngine()
             }
         }
 
@@ -113,7 +120,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         originalText = TextView(this).apply {
-            text = "YouTube native caption events will appear here."
+            text = "Waiting for YouTube timed captions…"
             setTextColor(Color.WHITE)
             textSize = 19f
             gravity = Gravity.CENTER
@@ -156,7 +163,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun translateCaption(text: String) {
-        if (!translationReady) return
+        if (!translationReady || text == lastTranslatedCaption) return
+        lastTranslatedCaption = text
         val generation = ++translationGeneration
         translator.translate(text)
             .addOnSuccessListener { translated ->
@@ -216,33 +224,49 @@ class MainActivity : AppCompatActivity() {
         return if (commonPrefix < current.size) commonPrefix else current.lastIndex
     }
 
-    private fun injectNativeCaptionObserver() {
-        webView.evaluateJavascript(NATIVE_CAPTION_OBSERVER_SCRIPT, null)
+    private fun injectCaptionEngine() {
+        webView.evaluateJavascript(captionEngineScript, null)
     }
 
     private inner class HighlightBridge {
         @JavascriptInterface
         fun onEvent(raw: String) {
             val event = runCatching { JSONObject(raw) }.getOrNull() ?: return
-            if (event.optString("type") != "caption") return
+            when (event.optString("type")) {
+                "status" -> {
+                    val message = event.optString("message").trim()
+                    if (message.isNotBlank()) runOnUiThread { statusText.text = message }
+                }
+
+                "caption" -> handleCaptionEvent(event)
+            }
+        }
+
+        private fun handleCaptionEvent(event: JSONObject) {
             val text = event.optString("text").trim()
             if (text.isBlank()) return
             val previous = event.optString("previousText").takeIf { it.isNotBlank() }
             val second = event.optDouble("currentSecond", Double.NaN)
-            val activeWord = chooseActiveWord(text, previous)
+            val source = event.optString("source").ifBlank { "unknown" }
+            val activeWord = if (event.has("activeWordIndex")) {
+                event.optInt("activeWordIndex", -1)
+            } else {
+                chooseActiveWord(text, previous)
+            }
 
             runOnUiThread {
                 renderCaption(text, activeWord)
                 translateCaption(text)
                 val tokenCount = tokenRegex.findAll(text).count()
                 statusText.text = if (second.isFinite()) {
-                    "YouTube DOM event @ %.3fs • word %d/%d".format(
+                    "%s @ %.3fs • word %d/%d".format(
+                        source.uppercase(),
                         second,
                         (activeWord + 1).coerceAtLeast(0),
                         tokenCount,
                     )
                 } else {
-                    "YouTube DOM caption event • word ${(activeWord + 1).coerceAtLeast(0)}/$tokenCount"
+                    "${source.uppercase()} caption • word ${(activeWord + 1).coerceAtLeast(0)}/$tokenCount"
                 }
             }
         }
@@ -253,130 +277,5 @@ class MainActivity : AppCompatActivity() {
         webView.removeJavascriptInterface("HighlightBridge")
         webView.destroy()
         super.onDestroy()
-    }
-
-    companion object {
-        private val NATIVE_CAPTION_OBSERVER_SCRIPT =
-            """
-            (function() {
-              const host = location.hostname.toLowerCase().replace(/\.$/, '');
-              if (location.protocol !== 'https:' ||
-                  !(host === 'youtube.com' || host.endsWith('.youtube.com'))) return;
-              if (window.__highlightDualSubLabInstalled) return;
-              window.__highlightDualSubLabInstalled = true;
-
-              const bridge = window.HighlightBridge;
-              if (!bridge || typeof bridge.onEvent !== 'function') return;
-
-              let captionRoot = null;
-              let captionObserver = null;
-              let lastCaptionText = '';
-              let lastMediaTime = null;
-              let captionEnableAttempts = 0;
-
-              function activeVideo() {
-                const videos = Array.from(document.querySelectorAll('video'));
-                return videos.find(v => !v.paused && !v.ended) ||
-                  videos.find(v => v.readyState > 0) || videos[0] || null;
-              }
-
-              function post(payload) {
-                try { bridge.onEvent(JSON.stringify(payload)); } catch (_) {}
-              }
-
-              function frameLoop() {
-                const video = activeVideo();
-                if (!video) {
-                  setTimeout(frameLoop, 120);
-                  return;
-                }
-                if (typeof video.requestVideoFrameCallback === 'function') {
-                  video.requestVideoFrameCallback(function(_, metadata) {
-                    lastMediaTime = metadata && Number.isFinite(metadata.mediaTime)
-                      ? metadata.mediaTime
-                      : video.currentTime;
-                    frameLoop();
-                  });
-                } else {
-                  lastMediaTime = video.currentTime;
-                  setTimeout(frameLoop, 40);
-                }
-              }
-
-              function ensureCaptionsEnabled() {
-                if (captionEnableAttempts > 20) return;
-                const button = document.querySelector('.ytp-subtitles-button');
-                if (button && button.getAttribute('aria-pressed') === 'false') {
-                  captionEnableAttempts += 1;
-                  try { button.click(); } catch (_) {}
-                }
-              }
-
-              function hideYouTubeCaptionPaintOnly() {
-                if (document.getElementById('highlight-dual-sub-hide-native-caption')) return;
-                const style = document.createElement('style');
-                style.id = 'highlight-dual-sub-hide-native-caption';
-                style.textContent =
-                  '.ytp-caption-window-container,.caption-window{' +
-                  'opacity:0.001!important;pointer-events:none!important;}';
-                (document.head || document.documentElement).appendChild(style);
-              }
-
-              function visibleCaptionText() {
-                if (!captionRoot) return '';
-                return Array.from(captionRoot.querySelectorAll('.ytp-caption-segment'))
-                  .map(node => node.textContent || '')
-                  .join(' ')
-                  .replace(/\s+/g, ' ')
-                  .trim();
-              }
-
-              function emitCaption() {
-                const text = visibleCaptionText();
-                if (!text || text === lastCaptionText) return;
-                const previousText = lastCaptionText;
-                lastCaptionText = text;
-                const video = activeVideo();
-                const currentSecond = Number.isFinite(lastMediaTime)
-                  ? lastMediaTime
-                  : (video && Number.isFinite(video.currentTime) ? video.currentTime : null);
-                post({
-                  type: 'caption',
-                  text: text,
-                  previousText: previousText || null,
-                  currentSecond: currentSecond,
-                  url: location.href
-                });
-              }
-
-              function bindCaptionObserver() {
-                const nextRoot = document.querySelector(
-                  '.ytp-caption-window-container, .caption-window'
-                );
-                if (nextRoot === captionRoot) return;
-                if (captionObserver) captionObserver.disconnect();
-                captionRoot = nextRoot;
-                lastCaptionText = '';
-                if (!captionRoot) return;
-                captionObserver = new MutationObserver(emitCaption);
-                captionObserver.observe(captionRoot, {
-                  childList: true,
-                  subtree: true,
-                  characterData: true
-                });
-                emitCaption();
-              }
-
-              frameLoop();
-              ensureCaptionsEnabled();
-              hideYouTubeCaptionPaintOnly();
-              bindCaptionObserver();
-              setInterval(function() {
-                ensureCaptionsEnabled();
-                hideYouTubeCaptionPaintOnly();
-                bindCaptionObserver();
-              }, 300);
-            })();
-            """.trimIndent()
     }
 }
