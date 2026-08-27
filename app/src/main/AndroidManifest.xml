@@ -5,7 +5,7 @@
     <application
         android:allowBackup="true"
         android:hardwareAccelerated="true"
-        android:label="Highlight Dual Sub Lab"
+        android:label="${appLabel}"
         android:supportsRtl="true"
         android:theme="@style/Theme.HighlightDualSubLab"
         android:usesCleartextTraffic="false">
