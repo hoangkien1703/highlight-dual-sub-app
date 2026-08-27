@@ -110,3 +110,11 @@ test('a truly new unrelated caption starts at its first word', () => {
   state = engine.reconcileDomState(state, 'completely new sentence', 51.0);
   assert.equal(state.activeWordIndex, 0);
 });
+
+test('provisional DOM state at 0s rebases on the first real media timestamp', () => {
+  let state = engine.reconcileDomState(null, 'full caption appears here', 0);
+  state = engine.reconcileDomState(state, 'full caption appears here', 126.0);
+  assert.equal(state.activeWordIndex, 0);
+  state = engine.reconcileDomState(state, 'full caption appears here', 126.33);
+  assert.equal(state.activeWordIndex, 1);
+});
