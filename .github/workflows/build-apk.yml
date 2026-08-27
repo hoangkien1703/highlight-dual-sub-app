@@ -1,4 +1,4 @@
-name: Build standalone APK
+name: Build preview APK
 
 on:
   push:
@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  build-preview:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -34,16 +34,44 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Build debug APK
+      - name: Build preview APK
         run: gradle :app:assembleDebug --stacktrace
 
-      - name: Package test APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk Highlight-Dual-Sub-Lab.apk
+      - name: Verify preview package and package APK
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk | head -n 1
+          package_line="$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk | head -n 1)"
+          if [[ "$package_line" != *"name='com.kienhoang.highlightdualsub.preview'"* ]]; then
+            echo "Unexpected preview package id" >&2
+            exit 1
+          fi
+          cp app/build/outputs/apk/debug/app-debug.apk Highlight-Dual-Sub-Lab-preview.apk
+          sha256sum Highlight-Dual-Sub-Lab-preview.apk > Highlight-Dual-Sub-Lab-preview.apk.sha256
 
-      - name: Upload APK
+      - name: Upload preview artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Highlight-Dual-Sub-Lab
-          path: Highlight-Dual-Sub-Lab.apk
+          name: Highlight-Dual-Sub-Lab-preview
+          path: |
+            Highlight-Dual-Sub-Lab-preview.apk
+            Highlight-Dual-Sub-Lab-preview.apk.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish rolling preview release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: preview
+          name: Highlight Dual Sub Lab Preview
+          prerelease: true
+          make_latest: false
+          body: |
+            Latest experimental preview build from `main`.
+
+            Package: `com.kienhoang.highlightdualsub.preview`
+
+            This preview installs separately from the original DualSub Replay app and from a future non-preview Highlight Dual Sub Lab build.
+          files: |
+            Highlight-Dual-Sub-Lab-preview.apk
+            Highlight-Dual-Sub-Lab-preview.apk.sha256
+          overwrite_files: true
