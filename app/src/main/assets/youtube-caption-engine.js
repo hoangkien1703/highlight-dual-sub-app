@@ -219,6 +219,14 @@
       ? secondsPerWord
       : DOM_WORD_SECONDS;
 
+    if (state.lastSecond === 0 && state.anchorSec === 0 && second > 1) {
+      return {
+        ...state,
+        anchorSec: second,
+        lastSecond: second,
+      };
+    }
+
     if (Number.isFinite(state.lastSecond) && second + 0.45 < state.lastSecond) {
       return { ...state, activeWordIndex: 0, anchorSec: second, lastSecond: second };
     }
