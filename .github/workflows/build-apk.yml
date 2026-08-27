@@ -42,42 +42,47 @@ jobs:
       - name: Build preview APK
         run: gradle :app:assembleDebug --stacktrace
 
-      - name: Verify preview package and package APK
+      - name: Verify package and number preview APK
+        id: package
+        env:
+          PREVIEW_BUILD: ${{ github.run_number }}
         run: |
-          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk | head -n 1
           package_line="$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk | head -n 1)"
+          echo "$package_line"
           if [[ "$package_line" != *"name='com.kienhoang.highlightdualsub.preview'"* ]]; then
             echo "Unexpected preview package id" >&2
             exit 1
           fi
-          cp app/build/outputs/apk/debug/app-debug.apk Highlight-Dual-Sub-Lab-preview.apk
-          sha256sum Highlight-Dual-Sub-Lab-preview.apk > Highlight-Dual-Sub-Lab-preview.apk.sha256
+          apk_name="Highlight-Dual-Sub-Lab-preview-${PREVIEW_BUILD}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$apk_name"
+          sha256sum "$apk_name" > "$apk_name.sha256"
+          echo "apk_name=$apk_name" >> "$GITHUB_OUTPUT"
 
-      - name: Upload preview artifact
+      - name: Upload numbered preview artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Highlight-Dual-Sub-Lab-preview
+          name: Highlight-Dual-Sub-Lab-preview-${{ github.run_number }}
           path: |
-            Highlight-Dual-Sub-Lab-preview.apk
-            Highlight-Dual-Sub-Lab-preview.apk.sha256
+            ${{ steps.package.outputs.apk_name }}
+            ${{ steps.package.outputs.apk_name }}.sha256
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish rolling preview release
+      - name: Publish numbered preview release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: preview
-          name: Highlight Dual Sub Lab Preview
+          tag_name: preview-${{ github.run_number }}
+          name: Highlight Dual Sub Lab Preview #${{ github.run_number }}
           prerelease: true
           make_latest: false
           body: |
-            Latest experimental preview build from `main`.
+            Preview build #${{ github.run_number }} from `main`.
 
             Package: `com.kienhoang.highlightdualsub.preview`
+            Commit: `${{ github.sha }}`
 
-            This preview installs separately from the original DualSub Replay app and from a future non-preview Highlight Dual Sub Lab build.
+            Preview APK filenames now include the GitHub Actions build number so newer test builds are easy to identify.
           files: |
-            Highlight-Dual-Sub-Lab-preview.apk
-            Highlight-Dual-Sub-Lab-preview.apk.sha256
-          overwrite_files: true
+            ${{ steps.package.outputs.apk_name }}
+            ${{ steps.package.outputs.apk_name }}.sha256

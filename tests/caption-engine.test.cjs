@@ -61,8 +61,60 @@ test('resolves m.youtube.com relative timed-text URL and forces JSON3', () => {
 });
 
 test('adds a same-origin mobile fallback for www.youtube.com timed-text', () => {
-  const urls = engine.buildTimedTextUrls('https://www.youtube.com/api/timedtext?v=abc', 'https://m.youtube.com');
+  const urls = engine.buildTimedTextUrls(
+    'https://www.youtube.com/api/timedtext?v=abc',
+    'https://m.youtube.com'
+  );
   assert.equal(urls.length, 2);
   assert.equal(new URL(urls[1]).origin, 'https://m.youtube.com');
   assert.equal(new URL(urls[1]).searchParams.get('fmt'), 'json3');
+});
+
+test('full rendered caption advances even when the DOM text never changes', () => {
+  let state = engine.reconcileDomState(null, 'one two three four', 10.0);
+  assert.equal(state.activeWordIndex, 0);
+  state = engine.reconcileDomState(state, 'one two three four', 10.33);
+  assert.equal(state.activeWordIndex, 1);
+  state = engine.reconcileDomState(state, 'one two three four', 10.66);
+  assert.equal(state.activeWordIndex, 2);
+  state = engine.reconcileDomState(state, 'one two three four', 11.0);
+  assert.equal(state.activeWordIndex, 3);
+});
+
+test('rolling auto captions keep progress instead of flashing back to word one', () => {
+  let state = engine.reconcileDomState(null, 'you explain it kind of', 20.0);
+  state = engine.reconcileDomState(state, 'you explain it kind of', 21.0);
+  assert.equal(state.activeWordIndex, 3);
+  state = engine.reconcileDomState(state, 'explain it kind of in', 21.1);
+  assert.equal(state.activeWordIndex, 4);
+});
+
+test('shrinking a rolling caption maps the old active word instead of resetting', () => {
+  let state = engine.reconcileDomState(null, 'right okay the ship', 30.0);
+  state = engine.reconcileDomState(state, 'right okay the ship', 31.1);
+  assert.equal(state.activeWordIndex, 3);
+  state = engine.reconcileDomState(state, 'okay the ship', 31.2);
+  assert.equal(state.activeWordIndex, 2);
+});
+
+test('incremental auto caption growth immediately highlights the newest spoken word', () => {
+  let state = engine.reconcileDomState(null, 'you explain', 40.0);
+  state = engine.reconcileDomState(state, 'you explain it', 40.2);
+  assert.equal(state.activeWordIndex, 2);
+  state = engine.reconcileDomState(state, 'you explain it kind', 40.5);
+  assert.equal(state.activeWordIndex, 3);
+});
+
+test('a truly new unrelated caption starts at its first word', () => {
+  let state = engine.reconcileDomState(null, 'old caption finished', 50.0);
+  state = engine.reconcileDomState(state, 'completely new sentence', 51.0);
+  assert.equal(state.activeWordIndex, 0);
+});
+
+test('provisional DOM state at 0s rebases on the first real media timestamp', () => {
+  let state = engine.reconcileDomState(null, 'full caption appears here', 0);
+  state = engine.reconcileDomState(state, 'full caption appears here', 126.0);
+  assert.equal(state.activeWordIndex, 0);
+  state = engine.reconcileDomState(state, 'full caption appears here', 126.33);
+  assert.equal(state.activeWordIndex, 1);
 });
