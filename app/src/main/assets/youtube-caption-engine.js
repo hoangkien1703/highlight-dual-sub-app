@@ -9,6 +9,7 @@
   'use strict';
 
   const WORD_RE = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
+  const DOM_WORD_SECONDS = 0.32;
 
   function normalizeText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
@@ -18,14 +19,18 @@
     return normalizeText(value).match(WORD_RE) || [];
   }
 
+  function lowerTokens(value) {
+    return tokens(value).map(word => word.toLocaleLowerCase());
+  }
+
   function pickCaptionTrack(tracks, preferredLanguage) {
     const list = Array.isArray(tracks) ? tracks.filter(Boolean) : [];
     if (!list.length) return null;
     const preferred = String(preferredLanguage || 'en').toLowerCase();
-    const languageMatches = list.filter(track =>
-      String(track.languageCode || '').toLowerCase() === preferred ||
-      String(track.languageCode || '').toLowerCase().startsWith(preferred + '-')
-    );
+    const languageMatches = list.filter(track => {
+      const code = String(track.languageCode || '').toLowerCase();
+      return code === preferred || code.startsWith(preferred + '-');
+    });
     return languageMatches.find(track => track.kind === 'asr') ||
       languageMatches[0] ||
       list.find(track => track.kind === 'asr') ||
@@ -67,15 +72,13 @@
         : Math.max(1200, cueTokens.length * 320);
       const cueStart = startMs / 1000;
       const cueEnd = (startMs + durationMs) / 1000;
-
       const tokenSegments = [];
-      for (let i = 0; i < rawSegs.length; i += 1) {
-        const seg = rawSegs[i] || {};
-        const segTokens = tokens(seg.utf8 || '');
+
+      for (const seg of rawSegs) {
+        const segTokens = tokens(seg && seg.utf8 || '');
         if (!segTokens.length) continue;
-        const offsetMs = Number(seg.tOffsetMs);
+        const offsetMs = Number(seg && seg.tOffsetMs);
         tokenSegments.push({
-          index: i,
           tokens: segTokens,
           offsetMs: Number.isFinite(offsetMs) && offsetMs >= 0 ? offsetMs : null,
         });
@@ -96,11 +99,14 @@
           const usableEnd = Math.max(segmentStart + 0.04 * segment.tokens.length, segmentEnd);
           const slice = Math.max(0.04, (usableEnd - segmentStart) / segment.tokens.length);
           segment.tokens.forEach((word, wordIndex) => {
-            const wordStart = segmentStart + slice * wordIndex;
-            const wordEnd = wordIndex === segment.tokens.length - 1
-              ? usableEnd
-              : segmentStart + slice * (wordIndex + 1);
-            words.push({ text: word, startSec: wordStart, endSec: wordEnd, exactChunkStart: wordIndex === 0 });
+            words.push({
+              text: word,
+              startSec: segmentStart + slice * wordIndex,
+              endSec: wordIndex === segment.tokens.length - 1
+                ? usableEnd
+                : segmentStart + slice * (wordIndex + 1),
+              exactChunkStart: wordIndex === 0,
+            });
           });
         }
       } else {
@@ -175,23 +181,147 @@
     return urls;
   }
 
+  function longestSuffixPrefixOverlap(previousTokens, currentTokens) {
+    const before = Array.isArray(previousTokens) ? previousTokens : [];
+    const current = Array.isArray(currentTokens) ? currentTokens : [];
+    const limit = Math.min(before.length, current.length);
+    for (let size = limit; size > 0; size -= 1) {
+      let matches = true;
+      for (let i = 0; i < size; i += 1) {
+        if (before[before.length - size + i] !== current[i]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return size;
+    }
+    return 0;
+  }
+
+  function createDomState(text, currentSecond) {
+    const clean = normalizeText(text);
+    const words = lowerTokens(clean);
+    if (!clean || !words.length) return null;
+    const second = Number.isFinite(currentSecond) ? currentSecond : 0;
+    return {
+      text: clean,
+      tokens: words,
+      activeWordIndex: 0,
+      anchorSec: second,
+      lastSecond: second,
+    };
+  }
+
+  function advanceDomState(state, currentSecond, secondsPerWord) {
+    if (!state || !Array.isArray(state.tokens) || !state.tokens.length) return state;
+    const second = Number.isFinite(currentSecond) ? currentSecond : state.lastSecond;
+    const step = Number.isFinite(secondsPerWord) && secondsPerWord > 0
+      ? secondsPerWord
+      : DOM_WORD_SECONDS;
+
+    if (Number.isFinite(state.lastSecond) && second + 0.45 < state.lastSecond) {
+      return { ...state, activeWordIndex: 0, anchorSec: second, lastSecond: second };
+    }
+
+    const elapsed = Math.max(0, second - state.anchorSec);
+    const estimatedIndex = Math.min(state.tokens.length - 1, Math.floor(elapsed / step));
+    return {
+      ...state,
+      activeWordIndex: Math.max(state.activeWordIndex, estimatedIndex),
+      lastSecond: second,
+    };
+  }
+
+  function reconcileDomState(previousState, text, currentSecond, secondsPerWord) {
+    const clean = normalizeText(text);
+    const currentTokens = lowerTokens(clean);
+    if (!clean || !currentTokens.length) return previousState || null;
+    const second = Number.isFinite(currentSecond)
+      ? currentSecond
+      : (previousState && previousState.lastSecond) || 0;
+
+    if (!previousState || !Array.isArray(previousState.tokens) || !previousState.tokens.length) {
+      return createDomState(clean, second);
+    }
+
+    const previousTokens = previousState.tokens;
+    if (clean === previousState.text &&
+        currentTokens.length === previousTokens.length &&
+        currentTokens.every((word, index) => word === previousTokens[index])) {
+      return advanceDomState(previousState, second, secondsPerWord);
+    }
+
+    const isPrefixGrowth = currentTokens.length > previousTokens.length &&
+      previousTokens.every((word, index) => word === currentTokens[index]);
+    if (isPrefixGrowth) {
+      const activeWordIndex = currentTokens.length - 1;
+      const step = Number.isFinite(secondsPerWord) && secondsPerWord > 0
+        ? secondsPerWord : DOM_WORD_SECONDS;
+      return {
+        text: clean,
+        tokens: currentTokens,
+        activeWordIndex,
+        anchorSec: second - activeWordIndex * step,
+        lastSecond: second,
+      };
+    }
+
+    const overlap = longestSuffixPrefixOverlap(previousTokens, currentTokens);
+    if (overlap > 0) {
+      const dropped = previousTokens.length - overlap;
+      const mappedOldIndex = Math.max(0, previousState.activeWordIndex - dropped);
+      const appendedCount = currentTokens.length - overlap;
+      const activeWordIndex = appendedCount > 0
+        ? currentTokens.length - 1
+        : Math.min(currentTokens.length - 1, mappedOldIndex);
+      const step = Number.isFinite(secondsPerWord) && secondsPerWord > 0
+        ? secondsPerWord : DOM_WORD_SECONDS;
+      return {
+        text: clean,
+        tokens: currentTokens,
+        activeWordIndex,
+        anchorSec: second - activeWordIndex * step,
+        lastSecond: second,
+      };
+    }
+
+    const activeToken = previousTokens[previousState.activeWordIndex];
+    if (activeToken) {
+      for (let i = currentTokens.length - 1; i >= 0; i -= 1) {
+        if (currentTokens[i] === activeToken) {
+          const step = Number.isFinite(secondsPerWord) && secondsPerWord > 0
+            ? secondsPerWord : DOM_WORD_SECONDS;
+          return {
+            text: clean,
+            tokens: currentTokens,
+            activeWordIndex: i,
+            anchorSec: second - i * step,
+            lastSecond: second,
+          };
+        }
+      }
+    }
+
+    return createDomState(clean, second);
+  }
+
   function install(bridge) {
     if (typeof window === 'undefined' || typeof document === 'undefined') return;
     const host = String(location.hostname || '').toLowerCase().replace(/\.$/, '');
     if (location.protocol !== 'https:' || !(host === 'youtube.com' || host.endsWith('.youtube.com'))) return;
-    if (window.__highlightDualSubLabEngineInstalled) return;
-    window.__highlightDualSubLabEngineInstalled = true;
-
+    if (window.__highlightDualSubLabEngineV2Installed) return;
+    window.__highlightDualSubLabEngineV2Installed = true;
     if (!bridge || typeof bridge.onEvent !== 'function') return;
 
     let cues = [];
     let loadedVideoId = '';
     let loadingVideoId = '';
     let lastCaptionKey = '';
-    let lastDomText = '';
     let lastStatus = '';
     let lastMediaTime = null;
     let lastTimedTextFailureAt = 0;
+    let domState = null;
+    let lastDomEmitKey = '';
 
     function post(payload) {
       try { bridge.onEvent(JSON.stringify(payload)); } catch (_) {}
@@ -263,23 +393,20 @@
     async function loadTrackForCurrentVideo() {
       const videoId = currentVideoId();
       if (!videoId || videoId === loadedVideoId || videoId === loadingVideoId) return;
-
       const response = getPlayerResponse();
       if (!response) {
         status('Waiting for YouTube player response…');
         return;
       }
       const responseId = response.videoDetails && response.videoDetails.videoId
-        ? String(response.videoDetails.videoId)
-        : videoId;
+        ? String(response.videoDetails.videoId) : videoId;
       if (responseId && responseId !== videoId) {
         status('Waiting for current video caption metadata…');
         return;
       }
-
       const tracks = captionTracksFromPlayerResponse(response);
       if (!tracks.length) {
-        status('No caption track found yet • DOM fallback active');
+        status('No caption track found yet • smart DOM fallback active');
         return;
       }
       const track = pickCaptionTrack(tracks, 'en');
@@ -298,11 +425,13 @@
         cues = parsed;
         loadedVideoId = videoId;
         lastCaptionKey = '';
+        domState = null;
+        lastDomEmitKey = '';
         status('YouTube JSON3 ready • ' + parsed.length + ' timed caption cues');
-      } catch (error) {
+      } catch (_) {
         cues = [];
         lastTimedTextFailureAt = Date.now();
-        status('Timed-text failed • using rendered-caption fallback');
+        status('Timed-text failed • smart DOM clock fallback active');
       } finally {
         loadingVideoId = '';
       }
@@ -340,29 +469,21 @@
 
     function emitDomFallback(currentSecond) {
       const text = visibleDomCaptionText();
-      if (!text || text === lastDomText) return;
-      const previous = lastDomText;
-      lastDomText = text;
-      const current = tokens(text.toLowerCase());
-      const before = tokens(previous.toLowerCase());
-      let activeWordIndex = current.length ? current.length - 1 : -1;
-      if (before.length && current.length > before.length &&
-          current.slice(0, before.length).every((word, index) => word === before[index])) {
-        activeWordIndex = current.length - 1;
-      } else {
-        let prefix = 0;
-        while (prefix < current.length && prefix < before.length && current[prefix] === before[prefix]) prefix += 1;
-        if (prefix < current.length) activeWordIndex = prefix;
-      }
+      if (!text) return false;
+      domState = reconcileDomState(domState, text, currentSecond, DOM_WORD_SECONDS);
+      if (!domState) return false;
+      const key = domState.text + ':' + domState.activeWordIndex;
+      if (key === lastDomEmitKey) return true;
+      lastDomEmitKey = key;
       post({
         type: 'caption',
-        text,
-        previousText: previous || null,
-        activeWordIndex,
+        text: domState.text,
+        activeWordIndex: domState.activeWordIndex,
         currentSecond,
-        source: 'dom',
+        source: 'dom-clock',
         url: location.href,
       });
+      return true;
     }
 
     function ensureCaptionsEnabled() {
@@ -372,9 +493,7 @@
           .filter(node => /caption|subtitle/i.test(node.getAttribute('aria-label') || '')),
       ].filter(Boolean);
       const button = candidates[0];
-      if (!button) return;
-      const pressed = button.getAttribute('aria-pressed');
-      if (pressed === 'false') {
+      if (button && button.getAttribute('aria-pressed') === 'false') {
         try { button.click(); } catch (_) {}
       }
     }
@@ -387,8 +506,7 @@
       }
       const onFrame = function (_, metadata) {
         const currentSecond = metadata && Number.isFinite(metadata.mediaTime)
-          ? metadata.mediaTime
-          : video.currentTime;
+          ? metadata.mediaTime : video.currentTime;
         lastMediaTime = currentSecond;
         if (!emitTimedCaption(currentSecond)) emitDomFallback(currentSecond);
         frameLoop();
@@ -405,7 +523,7 @@
     });
     domObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 
-    status('Caption engine installed • waiting for a video');
+    status('Caption engine v2 installed • waiting for a video');
     frameLoop();
     setInterval(function () {
       ensureCaptionsEnabled();
@@ -426,6 +544,10 @@
     parseJson3,
     findActiveCaption,
     buildTimedTextUrls,
+    longestSuffixPrefixOverlap,
+    createDomState,
+    advanceDomState,
+    reconcileDomState,
     install,
   };
 });
