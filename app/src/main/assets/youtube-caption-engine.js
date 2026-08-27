@@ -1,0 +1,431 @@
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.HighlightCaptionEngine = api;
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    try { api.install(window.HighlightBridge); } catch (_) {}
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const WORD_RE = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
+
+  function normalizeText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function tokens(value) {
+    return normalizeText(value).match(WORD_RE) || [];
+  }
+
+  function pickCaptionTrack(tracks, preferredLanguage) {
+    const list = Array.isArray(tracks) ? tracks.filter(Boolean) : [];
+    if (!list.length) return null;
+    const preferred = String(preferredLanguage || 'en').toLowerCase();
+    const languageMatches = list.filter(track =>
+      String(track.languageCode || '').toLowerCase() === preferred ||
+      String(track.languageCode || '').toLowerCase().startsWith(preferred + '-')
+    );
+    return languageMatches.find(track => track.kind === 'asr') ||
+      languageMatches[0] ||
+      list.find(track => track.kind === 'asr') ||
+      list[0];
+  }
+
+  function parsePlayerResponse(value) {
+    if (!value) return null;
+    if (typeof value === 'object') return value;
+    if (typeof value === 'string') {
+      try { return JSON.parse(value); } catch (_) { return null; }
+    }
+    return null;
+  }
+
+  function captionTracksFromPlayerResponse(response) {
+    return response && response.captions &&
+      response.captions.playerCaptionsTracklistRenderer &&
+      Array.isArray(response.captions.playerCaptionsTracklistRenderer.captionTracks)
+      ? response.captions.playerCaptionsTracklistRenderer.captionTracks
+      : [];
+  }
+
+  function parseJson3(payload) {
+    const events = payload && Array.isArray(payload.events) ? payload.events : [];
+    const cues = [];
+
+    for (const event of events) {
+      const startMs = Number(event && event.tStartMs);
+      if (!Number.isFinite(startMs)) continue;
+      const rawSegs = Array.isArray(event.segs) ? event.segs : [];
+      const text = normalizeText(rawSegs.map(seg => seg && seg.utf8 || '').join(''));
+      const cueTokens = tokens(text);
+      if (!text || !cueTokens.length) continue;
+
+      const durationMsRaw = Number(event.dDurationMs);
+      const durationMs = Number.isFinite(durationMsRaw) && durationMsRaw > 0
+        ? durationMsRaw
+        : Math.max(1200, cueTokens.length * 320);
+      const cueStart = startMs / 1000;
+      const cueEnd = (startMs + durationMs) / 1000;
+
+      const tokenSegments = [];
+      for (let i = 0; i < rawSegs.length; i += 1) {
+        const seg = rawSegs[i] || {};
+        const segTokens = tokens(seg.utf8 || '');
+        if (!segTokens.length) continue;
+        const offsetMs = Number(seg.tOffsetMs);
+        tokenSegments.push({
+          index: i,
+          tokens: segTokens,
+          offsetMs: Number.isFinite(offsetMs) && offsetMs >= 0 ? offsetMs : null,
+        });
+      }
+
+      const everyChunkAnchored = tokenSegments.length > 0 &&
+        tokenSegments.every(segment => segment.offsetMs !== null);
+      const words = [];
+
+      if (everyChunkAnchored) {
+        for (let i = 0; i < tokenSegments.length; i += 1) {
+          const segment = tokenSegments[i];
+          const next = tokenSegments[i + 1];
+          const segmentStart = cueStart + segment.offsetMs / 1000;
+          const segmentEnd = next && next.offsetMs !== null
+            ? Math.min(cueEnd, cueStart + next.offsetMs / 1000)
+            : cueEnd;
+          const usableEnd = Math.max(segmentStart + 0.04 * segment.tokens.length, segmentEnd);
+          const slice = Math.max(0.04, (usableEnd - segmentStart) / segment.tokens.length);
+          segment.tokens.forEach((word, wordIndex) => {
+            const wordStart = segmentStart + slice * wordIndex;
+            const wordEnd = wordIndex === segment.tokens.length - 1
+              ? usableEnd
+              : segmentStart + slice * (wordIndex + 1);
+            words.push({ text: word, startSec: wordStart, endSec: wordEnd, exactChunkStart: wordIndex === 0 });
+          });
+        }
+      } else {
+        const slice = Math.max(0.06, (cueEnd - cueStart) / cueTokens.length);
+        cueTokens.forEach((word, index) => {
+          words.push({
+            text: word,
+            startSec: cueStart + slice * index,
+            endSec: index === cueTokens.length - 1 ? cueEnd : cueStart + slice * (index + 1),
+            exactChunkStart: index === 0,
+          });
+        });
+      }
+
+      if (words.length !== cueTokens.length) {
+        words.length = 0;
+        const slice = Math.max(0.06, (cueEnd - cueStart) / cueTokens.length);
+        cueTokens.forEach((word, index) => {
+          words.push({
+            text: word,
+            startSec: cueStart + slice * index,
+            endSec: index === cueTokens.length - 1 ? cueEnd : cueStart + slice * (index + 1),
+            exactChunkStart: index === 0,
+          });
+        });
+      }
+
+      cues.push({ text, startSec: cueStart, endSec: cueEnd, words });
+    }
+
+    cues.sort((a, b) => a.startSec - b.startSec);
+    return cues;
+  }
+
+  function findActiveCaption(cues, currentSecond, leadSeconds) {
+    if (!Array.isArray(cues) || !cues.length || !Number.isFinite(currentSecond)) return null;
+    const t = currentSecond + (Number.isFinite(leadSeconds) ? leadSeconds : 0.06);
+    let cue = null;
+    for (let i = 0; i < cues.length; i += 1) {
+      const candidate = cues[i];
+      if (candidate.startSec <= t && t <= candidate.endSec + 0.3) cue = candidate;
+      if (candidate.startSec > t) break;
+    }
+    if (!cue) return null;
+
+    let activeWordIndex = 0;
+    for (let i = 0; i < cue.words.length; i += 1) {
+      if (cue.words[i].startSec <= t) activeWordIndex = i;
+      else break;
+    }
+    return { cue, activeWordIndex };
+  }
+
+  function buildTimedTextUrls(baseUrl, pageOrigin) {
+    if (!baseUrl) return [];
+    const origin = pageOrigin || 'https://www.youtube.com';
+    let parsed;
+    try { parsed = new URL(baseUrl, origin); } catch (_) { return []; }
+    parsed.searchParams.set('fmt', 'json3');
+    const urls = [parsed.toString()];
+
+    let currentOrigin;
+    try { currentOrigin = new URL(origin); } catch (_) { currentOrigin = null; }
+    if (currentOrigin && parsed.hostname.endsWith('youtube.com') &&
+        currentOrigin.hostname.endsWith('youtube.com') && parsed.origin !== currentOrigin.origin) {
+      const sameOrigin = new URL(parsed.toString());
+      sameOrigin.protocol = currentOrigin.protocol;
+      sameOrigin.host = currentOrigin.host;
+      const candidate = sameOrigin.toString();
+      if (!urls.includes(candidate)) urls.push(candidate);
+    }
+    return urls;
+  }
+
+  function install(bridge) {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+    const host = String(location.hostname || '').toLowerCase().replace(/\.$/, '');
+    if (location.protocol !== 'https:' || !(host === 'youtube.com' || host.endsWith('.youtube.com'))) return;
+    if (window.__highlightDualSubLabEngineInstalled) return;
+    window.__highlightDualSubLabEngineInstalled = true;
+
+    if (!bridge || typeof bridge.onEvent !== 'function') return;
+
+    let cues = [];
+    let loadedVideoId = '';
+    let loadingVideoId = '';
+    let lastCaptionKey = '';
+    let lastDomText = '';
+    let lastStatus = '';
+    let lastMediaTime = null;
+    let lastTimedTextFailureAt = 0;
+
+    function post(payload) {
+      try { bridge.onEvent(JSON.stringify(payload)); } catch (_) {}
+    }
+
+    function status(message) {
+      if (!message || message === lastStatus) return;
+      lastStatus = message;
+      post({ type: 'status', message });
+    }
+
+    function currentPlayer() {
+      return document.querySelector('#movie_player') || document.querySelector('.html5-video-player');
+    }
+
+    function activeVideo() {
+      const videos = Array.from(document.querySelectorAll('video'));
+      return videos.find(video => !video.paused && !video.ended) ||
+        videos.find(video => video.readyState > 0) || videos[0] || null;
+    }
+
+    function currentVideoId() {
+      const player = currentPlayer();
+      try {
+        const data = player && typeof player.getVideoData === 'function' ? player.getVideoData() : null;
+        if (data && data.video_id) return String(data.video_id);
+      } catch (_) {}
+      try {
+        const url = new URL(location.href);
+        return url.searchParams.get('v') || '';
+      } catch (_) { return ''; }
+    }
+
+    function getPlayerResponse() {
+      const player = currentPlayer();
+      try {
+        if (player && typeof player.getPlayerResponse === 'function') {
+          const response = parsePlayerResponse(player.getPlayerResponse());
+          if (response) return response;
+        }
+      } catch (_) {}
+      const initial = parsePlayerResponse(window.ytInitialPlayerResponse);
+      if (initial) return initial;
+      try {
+        const configured = parsePlayerResponse(window.ytplayer && window.ytplayer.config &&
+          window.ytplayer.config.args && window.ytplayer.config.args.player_response);
+        if (configured) return configured;
+      } catch (_) {}
+      return null;
+    }
+
+    async function fetchJson3(track) {
+      const urls = buildTimedTextUrls(track && track.baseUrl, location.origin);
+      let lastError = null;
+      for (const url of urls) {
+        try {
+          const response = await fetch(url, { credentials: 'include', cache: 'no-store' });
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          const json = await response.json();
+          if (json && Array.isArray(json.events)) return json;
+          throw new Error('JSON3 response has no events');
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError || new Error('No timed-text URL');
+    }
+
+    async function loadTrackForCurrentVideo() {
+      const videoId = currentVideoId();
+      if (!videoId || videoId === loadedVideoId || videoId === loadingVideoId) return;
+
+      const response = getPlayerResponse();
+      if (!response) {
+        status('Waiting for YouTube player response…');
+        return;
+      }
+      const responseId = response.videoDetails && response.videoDetails.videoId
+        ? String(response.videoDetails.videoId)
+        : videoId;
+      if (responseId && responseId !== videoId) {
+        status('Waiting for current video caption metadata…');
+        return;
+      }
+
+      const tracks = captionTracksFromPlayerResponse(response);
+      if (!tracks.length) {
+        status('No caption track found yet • DOM fallback active');
+        return;
+      }
+      const track = pickCaptionTrack(tracks, 'en');
+      if (!track || !track.baseUrl) {
+        status('Caption metadata found, but no timed-text URL');
+        return;
+      }
+
+      loadingVideoId = videoId;
+      status('Loading YouTube timed-text (' + (track.languageCode || 'unknown') +
+        (track.kind === 'asr' ? ', auto-generated' : '') + ')…');
+      try {
+        const json = await fetchJson3(track);
+        const parsed = parseJson3(json);
+        if (!parsed.length) throw new Error('No usable caption cues');
+        cues = parsed;
+        loadedVideoId = videoId;
+        lastCaptionKey = '';
+        status('YouTube JSON3 ready • ' + parsed.length + ' timed caption cues');
+      } catch (error) {
+        cues = [];
+        lastTimedTextFailureAt = Date.now();
+        status('Timed-text failed • using rendered-caption fallback');
+      } finally {
+        loadingVideoId = '';
+      }
+    }
+
+    function emitTimedCaption(currentSecond) {
+      const active = findActiveCaption(cues, currentSecond, 0.06);
+      if (!active) return false;
+      const key = active.cue.startSec.toFixed(3) + ':' + active.activeWordIndex;
+      if (key === lastCaptionKey) return true;
+      lastCaptionKey = key;
+      post({
+        type: 'caption',
+        text: active.cue.text,
+        activeWordIndex: active.activeWordIndex,
+        currentSecond,
+        source: 'json3',
+        url: location.href,
+      });
+      return true;
+    }
+
+    function visibleDomCaptionText() {
+      const segmentNodes = Array.from(document.querySelectorAll('.ytp-caption-segment'));
+      if (segmentNodes.length) {
+        return normalizeText(segmentNodes.map(node => node.textContent || '').join(' '));
+      }
+      const roots = Array.from(document.querySelectorAll('.ytp-caption-window-container, .caption-window'));
+      for (const root of roots) {
+        const text = normalizeText(root && root.textContent || '');
+        if (text) return text;
+      }
+      return '';
+    }
+
+    function emitDomFallback(currentSecond) {
+      const text = visibleDomCaptionText();
+      if (!text || text === lastDomText) return;
+      const previous = lastDomText;
+      lastDomText = text;
+      const current = tokens(text.toLowerCase());
+      const before = tokens(previous.toLowerCase());
+      let activeWordIndex = current.length ? current.length - 1 : -1;
+      if (before.length && current.length > before.length &&
+          current.slice(0, before.length).every((word, index) => word === before[index])) {
+        activeWordIndex = current.length - 1;
+      } else {
+        let prefix = 0;
+        while (prefix < current.length && prefix < before.length && current[prefix] === before[prefix]) prefix += 1;
+        if (prefix < current.length) activeWordIndex = prefix;
+      }
+      post({
+        type: 'caption',
+        text,
+        previousText: previous || null,
+        activeWordIndex,
+        currentSecond,
+        source: 'dom',
+        url: location.href,
+      });
+    }
+
+    function ensureCaptionsEnabled() {
+      const candidates = [
+        document.querySelector('.ytp-subtitles-button'),
+        ...Array.from(document.querySelectorAll('button[aria-label], [role="button"][aria-label]'))
+          .filter(node => /caption|subtitle/i.test(node.getAttribute('aria-label') || '')),
+      ].filter(Boolean);
+      const button = candidates[0];
+      if (!button) return;
+      const pressed = button.getAttribute('aria-pressed');
+      if (pressed === 'false') {
+        try { button.click(); } catch (_) {}
+      }
+    }
+
+    function frameLoop() {
+      const video = activeVideo();
+      if (!video) {
+        setTimeout(frameLoop, 120);
+        return;
+      }
+      const onFrame = function (_, metadata) {
+        const currentSecond = metadata && Number.isFinite(metadata.mediaTime)
+          ? metadata.mediaTime
+          : video.currentTime;
+        lastMediaTime = currentSecond;
+        if (!emitTimedCaption(currentSecond)) emitDomFallback(currentSecond);
+        frameLoop();
+      };
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        video.requestVideoFrameCallback(onFrame);
+      } else {
+        setTimeout(function () { onFrame(0, { mediaTime: video.currentTime }); }, 40);
+      }
+    }
+
+    const domObserver = new MutationObserver(function () {
+      if (!cues.length) emitDomFallback(Number.isFinite(lastMediaTime) ? lastMediaTime : 0);
+    });
+    domObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+
+    status('Caption engine installed • waiting for a video');
+    frameLoop();
+    setInterval(function () {
+      ensureCaptionsEnabled();
+      loadTrackForCurrentVideo();
+      if (!cues.length && lastTimedTextFailureAt && Date.now() - lastTimedTextFailureAt > 4000) {
+        loadedVideoId = '';
+        lastTimedTextFailureAt = 0;
+      }
+    }, 700);
+  }
+
+  return {
+    normalizeText,
+    tokens,
+    pickCaptionTrack,
+    parsePlayerResponse,
+    captionTracksFromPlayerResponse,
+    parseJson3,
+    findActiveCaption,
+    buildTimedTextUrls,
+    install,
+  };
+});
